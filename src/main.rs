@@ -2132,8 +2132,8 @@ fn main() -> Result<()> {
     println!("  Win+Up/Down          Switch between rows");
     println!("  Win+S                Scroll to current window");
     println!("\n🎨 APPEARANCE:");
-    println!("  Win+(Shift+)Plus     Increase transparency");
-    println!("  Win+(Shift+)Minus    Decrease transparency");
+    println!("  Win+Plus             Increase transparency");
+    println!("  Win+Minus            Decrease transparency");
     println!("  Win+M                Increase margins (+5H/+10V)");
     println!("  Win+N                Decrease margins (-5H/-10V)");
     println!("  Win+F                Cycle FPS (60→90→120→144)");
