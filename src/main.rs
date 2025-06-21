@@ -1362,6 +1362,7 @@ impl RibbonTiler {
 
         if let Some(window) = self.windows.get(&hwnd.0).cloned() {
             let old_size = window.position.size;
+            let old_width = self.get_tile_width(&old_size);
             
             let new_size = match (old_size, direction) {
                 (TileSize::Full, Direction::Left | Direction::Right) => TileSize::Half,
@@ -1369,11 +1370,36 @@ impl RibbonTiler {
                 _ => old_size,
             };
             
+            let new_width = self.get_tile_width(&new_size);
+            let width_diff = new_width - old_width;
+            
             if let Some(w) = self.windows.get_mut(&hwnd.0) {
                 w.position.size = new_size;
             }
             
-            self.pull_adjacent_windows(hwnd.0);
+            // If expanding, push windows to the right
+            if width_diff > 0 {
+                let current_pos = window.position;
+                let current_end = current_pos.x + old_width;
+                
+                // Find all windows to the right on the same row that need to be pushed
+                let windows_to_push: Vec<isize> = self.windows.iter()
+                    .filter(|(h, w)| {
+                        **h != hwnd.0 && 
+                        w.position.row == current_pos.row && 
+                        w.position.x >= current_end
+                    })
+                    .map(|(h, _)| *h)
+                    .collect();
+                
+                // Push them right by the width difference
+                for hwnd_to_push in windows_to_push {
+                    if let Some(w) = self.windows.get_mut(&hwnd_to_push) {
+                        w.position.x += width_diff;
+                    }
+                }
+            }
+            
             self.needs_ribbon_recalc = true;
         }
         
@@ -1483,63 +1509,70 @@ impl RibbonTiler {
                 }
             },
             Direction::Left | Direction::Right => {
-                // Get windows on the same row
-                let mut windows_on_row: Vec<(isize, i32, i32)> = self.windows.iter()
-                    .filter(|(_, w)| w.position.row == current_pos.row)
-                    .map(|(h, w)| (*h, w.position.x, self.get_tile_width(&w.position.size)))
-                    .collect();
-                windows_on_row.sort_by_key(|(_, x, _)| *x);
-                
-                let current_index = windows_on_row.iter().position(|(h, _, _)| *h == hwnd.0);
-                if current_index.is_none() {
-                    return;
-                }
-                let current_index = current_index.unwrap();
+                // Define the step size - half monitor width for consistent increments
+                let step_size = self.monitor_width / 2;
                 
                 let current_width = self.get_tile_width(&current_pos.size);
                 let old_x = current_pos.x;
                 let mut new_x = old_x;
-                let mut do_swap = false;
-                let mut swap_hwnd: Option<isize> = None;
+                
+                // Get windows on the same row for collision checking
+                let windows_on_row: Vec<(isize, i32, i32)> = self.windows.iter()
+                    .filter(|(_, w)| w.position.row == current_pos.row)
+                    .map(|(h, w)| (*h, w.position.x, self.get_tile_width(&w.position.size)))
+                    .collect();
                 
                 match direction {
                     Direction::Left => {
-                        if current_index == 0 {
-                            // Moving into empty space at the beginning
-                            new_x = 0;
-                        } else {
-                            let (left_hwnd, left_x, left_width) = windows_on_row[current_index - 1];
-                            let gap_start = left_x + left_width;
-                            let gap_size = old_x - gap_start;
-                            
-                            if gap_size > 0 {
-                                // Move into the gap
-                                new_x = gap_start;
-                            } else {
-                                // Swap with left window
-                                do_swap = true;
-                                swap_hwnd = Some(left_hwnd);
-                                new_x = left_x;
+                        // Move left by step_size, but check for collisions
+                        let proposed_x = (old_x - step_size).max(0);
+                        
+                        // Check if this position would overlap with any window
+                        let mut blocked = false;
+                        for (other_hwnd, other_x, other_width) in &windows_on_row {
+                            if *other_hwnd != hwnd.0 {
+                                let other_end = other_x + other_width;
+                                // Check if we would overlap
+                                if proposed_x < other_end && proposed_x + current_width > *other_x {
+                                    // We would overlap, so swap positions instead
+                                    new_x = *other_x;
+                                    if let Some(w) = self.windows.get_mut(other_hwnd) {
+                                        w.position.x = old_x;
+                                    }
+                                    blocked = true;
+                                    break;
+                                }
                             }
+                        }
+                        
+                        if !blocked {
+                            new_x = proposed_x;
                         }
                     },
                     Direction::Right => {
-                        if current_index == windows_on_row.len() - 1 {
-                            // Moving into empty space at the end
-                            new_x = old_x + current_width;
-                        } else {
-                            let (right_hwnd, right_x, right_width) = windows_on_row[current_index + 1];
-                            let gap_size = right_x - (old_x + current_width);
-                            
-                            if gap_size > 0 {
-                                // Move into the gap
-                                new_x = right_x - current_width;
-                            } else {
-                                // Swap with right window
-                                do_swap = true;
-                                swap_hwnd = Some(right_hwnd);
-                                new_x = right_x;
+                        // Move right by step_size
+                        let proposed_x = old_x + step_size;
+                        
+                        // Check if this position would overlap with any window
+                        let mut blocked = false;
+                        for (other_hwnd, other_x, other_width) in &windows_on_row {
+                            if *other_hwnd != hwnd.0 {
+                                let other_end = other_x + other_width;
+                                // Check if we would overlap
+                                if proposed_x < other_end && proposed_x + current_width > *other_x {
+                                    // We would overlap, so swap positions instead
+                                    new_x = *other_x;
+                                    if let Some(w) = self.windows.get_mut(other_hwnd) {
+                                        w.position.x = old_x;
+                                    }
+                                    blocked = true;
+                                    break;
+                                }
                             }
+                        }
+                        
+                        if !blocked {
+                            new_x = proposed_x;
                         }
                     },
                     _ => unreachable!(),
@@ -1556,26 +1589,9 @@ impl RibbonTiler {
                 let old_ribbon_offset = self.ribbon_offset;
                 let old_vertical_offset = self.vertical_offset;
                 
-                // Update positions
-                if do_swap && swap_hwnd.is_some() {
-                    let swap_hwnd = swap_hwnd.unwrap();
-                    
-                    if let Some(other_window) = self.windows.get(&swap_hwnd) {
-                        let other_x = other_window.position.x;
-                        
-                        // Swap positions
-                        if let Some(w) = self.windows.get_mut(&hwnd.0) {
-                            w.position.x = other_x;
-                        }
-                        if let Some(w) = self.windows.get_mut(&swap_hwnd) {
-                            w.position.x = old_x;
-                        }
-                    }
-                } else {
-                    // Just move to new position
-                    if let Some(w) = self.windows.get_mut(&hwnd.0) {
-                        w.position.x = new_x;
-                    }
+                // Update position
+                if let Some(w) = self.windows.get_mut(&hwnd.0) {
+                    w.position.x = new_x;
                 }
                 
                 // Update ribbon offset to keep focused window stationary
