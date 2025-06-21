@@ -21,12 +21,12 @@ Thymeline is a Windows application that manages other application windows, arran
 - **Popup Handling** - Dialog boxes and popups remain floating
 - **Entry/Exit Animations** - Visual feedback when adding/removing windows
 
-## 🎮 Keyboard Shortcuts
+## Keyboard Shortcuts
 
 ### Window Management
 | Shortcut | Action |
 |----------|--------|
-| `Win+Shift+T` | Add current window to grid |
+| `Win+Shift+T` | Add current floating window to the grid |
 | `Win+Shift+R` | Remove current window from grid |
 | `Win+C` | Force cleanup and recalculation |
 
