@@ -8,7 +8,7 @@ A window organizer for Windows that arranges application windows in a scrollable
 
 Thymeline is a Windows application that manages other application windows, arranging them in a 2D plane where you can scroll horizontally through columns and vertically through rows. Each window becomes a tile in this grid.
 
-**Note:** This is not a true window manager - it's an application that repositions and manages other windows. Your regular Windows desktop environment remains unchanged.. it was designed this way to help me stay organized on windows machines whre i don't have admin provileges.
+**Note:** This is not a true window manager - it's an application that repositions and manages other windows. Your regular Windows desktop environment remains unchanged.. it was designed this way to help users stay organized on windows machines where they don't have admin privileges.
 
 ## Features
 
