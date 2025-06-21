@@ -31,8 +31,8 @@ const WM_TILER_RECALC: u32 = WM_USER + 4;
 enum TilerCommand {
     PanLeft = 0,
     PanRight = 1,
-    ResizeUp = 2,
-    ResizeDown = 3,
+    PanUp = 2,
+    PanDown = 3,
     ResizeLeft = 4,
     ResizeRight = 5,
     MoveUp = 6,
@@ -67,20 +67,29 @@ enum AnimationType {
     Exit,       // Scale down to center on exit
 }
 
-// Window size variants
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum TileSize {
-    Full,           // Full screen
-    HalfHorizontal, // Horizontal split - full width, half height (short and wide)
-    HalfVertical,   // Vertical split - half width, full height (tall and narrow)
-    Quarter,        // Quarter screen
+// Combined scroll animation state
+#[derive(Debug, Clone)]
+struct ScrollAnimation {
+    start_x: i32,
+    start_y: i32,
+    target_x: i32,
+    target_y: i32,
+    start_time: Instant,
+    duration: Duration,
 }
 
-// Position in the ribbon (x is the virtual position)
+// Window size variants - simplified to just width variations
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TileSize {
+    Full,           // Full screen width
+    Half,           // Half screen width
+}
+
+// Position in the ribbon (x is the virtual position, row is the vertical row)
 #[derive(Debug, Clone, Copy)]
 struct RibbonPosition {
-    x: i32,  // Virtual x position in ribbon
-    y: i32,  // Y position (0 or 1 for top/bottom half)
+    x: i32,         // Virtual x position in ribbon
+    row: i32,       // Row number (0, 1, 2, etc.)
     size: TileSize,
 }
 
@@ -108,7 +117,11 @@ struct RibbonTiler {
     floating_windows: HashMap<isize, HWND>,
     ribbon_offset: i32,
     ribbon_offset_target: i32,
-    ribbon_offset_animation: Option<(Instant, i32, i32)>,
+    vertical_offset: i32,              // Current vertical scroll offset
+    vertical_offset_target: i32,       // Target vertical scroll offset
+    scroll_animation: Option<ScrollAnimation>, // Combined scroll animation
+    current_row: i32,                  // Currently visible row
+    row_height: i32,                   // Height of each row
     monitor_width: i32,
     monitor_height: i32,
     last_resolution_check: Instant,
@@ -119,12 +132,12 @@ struct RibbonTiler {
     animation_running: Arc<Mutex<bool>>,
     animation_stop_requested: Arc<Mutex<bool>>,
     main_thread_id: u32,
-    main_hwnd: HWND, // Hidden window for message processing
+    main_hwnd: HWND,
     command_queue: Vec<QueuedCommand>,
-    last_command_time: HashMap<u32, Instant>, // Track last execution time per command type
-    animation_fps: u64, // Configurable animation frame rate
-    needs_ribbon_recalc: bool, // Flag to indicate ribbon needs recalculation
-    last_ribbon_recalc: Instant, // Last time ribbon was recalculated
+    last_command_time: HashMap<u32, Instant>,
+    animation_fps: u64,
+    needs_ribbon_recalc: bool,
+    last_ribbon_recalc: Instant,
 }
 
 impl RibbonTiler {
@@ -152,13 +165,16 @@ impl RibbonTiler {
             hwnd
         };
         
-        //println!("Ribbon Tiler initialized - Monitor: {}x{}, Margins: H:{}px V:{}px, Animation: {} FPS", width, height, 40, 80, 90);
         Self {
             windows: HashMap::new(),
             floating_windows: HashMap::new(),
             ribbon_offset: 0,
             ribbon_offset_target: 0,
-            ribbon_offset_animation: None,
+            vertical_offset: 0,
+            vertical_offset_target: 0,
+            scroll_animation: None,
+            current_row: 0,
+            row_height: height,  // Each row is full monitor height
             monitor_width: width,
             monitor_height: height,
             last_resolution_check: Instant::now(),
@@ -196,7 +212,7 @@ impl RibbonTiler {
         
         for queued in commands {
             let should_throttle = match queued.command {
-                TilerCommand::PanLeft | TilerCommand::PanRight => false,
+                TilerCommand::PanLeft | TilerCommand::PanRight | TilerCommand::PanUp | TilerCommand::PanDown => false,
                 _ => true,
             };
             
@@ -213,8 +229,8 @@ impl RibbonTiler {
             match queued.command {
                 TilerCommand::PanLeft => self.pan_ribbon(Direction::Left),
                 TilerCommand::PanRight => self.pan_ribbon(Direction::Right),
-                TilerCommand::ResizeUp => self.resize_window(queued.hwnd, Direction::Up),
-                TilerCommand::ResizeDown => self.resize_window(queued.hwnd, Direction::Down),
+                TilerCommand::PanUp => self.pan_row(Direction::Up),
+                TilerCommand::PanDown => self.pan_row(Direction::Down),
                 TilerCommand::ResizeLeft => self.resize_window(queued.hwnd, Direction::Left),
                 TilerCommand::ResizeRight => self.resize_window(queued.hwnd, Direction::Right),
                 TilerCommand::MoveUp => self.move_window(queued.hwnd, Direction::Up),
@@ -233,14 +249,12 @@ impl RibbonTiler {
                 TilerCommand::DecreaseMargins => self.adjust_margins(-5),
                 TilerCommand::RemoveWindow => {
                     self.remove_window(queued.hwnd);
-                    // Immediately trigger recalculation instead of waiting
                     if self.needs_ribbon_recalc {
                         self.recalculate_ribbon();
                     }
                 },
                 TilerCommand::CycleFPS => self.cycle_fps(),
                 TilerCommand::ForceRecalc => {
-                    //println!("\nForcing cleanup and recalculation...");
                     self.clean_closed_windows();
                     self.recalculate_ribbon();
                 },
@@ -266,33 +280,44 @@ impl RibbonTiler {
     }
 
     fn is_window_visible(&self, pos: &RibbonPosition) -> bool {
+        // Check horizontal visibility
         let window_start = pos.x - self.ribbon_offset;
         let window_end = window_start + self.get_tile_width(&pos.size);
-        let buffer = self.monitor_width;
-        window_end >= -buffer && window_start <= self.monitor_width + buffer
+        let h_visible = window_end >= -self.monitor_width && window_start <= self.monitor_width * 2;
+        
+        // Check vertical visibility
+        let window_top = pos.row * self.row_height - self.vertical_offset;
+        let window_bottom = window_top + self.row_height;
+        let v_visible = window_bottom >= -self.row_height && window_top <= self.monitor_height + self.row_height;
+        
+        h_visible && v_visible
     }
 
-    // Update animations - OPTIMIZED VERSION with batching and visibility culling
+    // Update animations
     fn update_animations(&mut self) {
         let now = Instant::now();
         let mut animations_complete = Vec::new();
         let mut window_updates = Vec::new();
         let mut need_reposition = false;
 
-        // Update ribbon offset animation
-        if let Some((start_time, start_offset, target_offset)) = self.ribbon_offset_animation {
-            let elapsed = now.duration_since(start_time);
-            let duration = Duration::from_millis(87);
+        // Update combined scroll animation
+        if let Some(scroll_anim) = &self.scroll_animation {
+            let elapsed = now.duration_since(scroll_anim.start_time);
             
-            if elapsed >= duration {
-                self.ribbon_offset = target_offset;
-                self.ribbon_offset_animation = None;
+            if elapsed >= scroll_anim.duration {
+                self.ribbon_offset = scroll_anim.target_x;
+                self.ribbon_offset_target = scroll_anim.target_x;
+                self.vertical_offset = scroll_anim.target_y;
+                self.vertical_offset_target = scroll_anim.target_y;
+                self.scroll_animation = None;
                 self.focus_visible_window();
                 self.needs_ribbon_recalc = true;
             } else {
-                let t = elapsed.as_secs_f32() / duration.as_secs_f32();
+                let t = elapsed.as_secs_f32() / scroll_anim.duration.as_secs_f32();
                 let eased_t = Self::ease_out_cubic(t);
-                self.ribbon_offset = Self::lerp(start_offset, target_offset, eased_t);
+                
+                self.ribbon_offset = Self::lerp(scroll_anim.start_x, scroll_anim.target_x, eased_t);
+                self.vertical_offset = Self::lerp(scroll_anim.start_y, scroll_anim.target_y, eased_t);
             }
             need_reposition = true;
         }
@@ -421,14 +446,13 @@ impl RibbonTiler {
         }
 
         // Check if all animations are complete
-        let all_complete = self.ribbon_offset_animation.is_none() &&
+        let all_complete = self.scroll_animation.is_none() &&
             self.windows.values().all(|w| w.animation.is_none());
         
         if all_complete {
             *self.animation_running.lock().unwrap() = false;
             *self.animation_stop_requested.lock().unwrap() = true;
             
-            // Check if ribbon needs recalculation (with debounce)
             if self.needs_ribbon_recalc {
                 let now = Instant::now();
                 if now.duration_since(self.last_ribbon_recalc).as_millis() > 500 {
@@ -453,9 +477,10 @@ impl RibbonTiler {
                         let width = rect.right - rect.left;
                         let height = rect.bottom - rect.top;
                         
+                        // Check if window is visible on screen
                         if width > 0 && height > 0 && 
-                           rect.left > -10000 && rect.top > -10000 && 
-                           rect.right < 10000 && rect.bottom < 10000 {
+                           rect.left < self.monitor_width * 2 && rect.right > -self.monitor_width &&
+                           rect.top < self.monitor_height * 2 && rect.bottom > -self.monitor_height {
                             match DeferWindowPos(
                                 hdwp_current,
                                 *hwnd,
@@ -484,7 +509,9 @@ impl RibbonTiler {
                         let width = rect.right - rect.left;
                         let height = rect.bottom - rect.top;
                         
-                        if width > 0 && height > 0 {
+                        if width > 0 && height > 0 &&
+                           rect.left > -20000 && rect.top > -20000 && 
+                           rect.right < 20000 && rect.bottom < 20000 {
                             SetWindowPos(
                                 *hwnd,
                                 HWND_TOP,
@@ -510,7 +537,9 @@ impl RibbonTiler {
                 return;
             }
             
-            if rect.left < -10000 || rect.top < -10000 || rect.right > 10000 || rect.bottom > 10000 {
+            // Allow windows to be positioned off-screen for smooth scrolling
+            // but prevent extreme values that could cause issues
+            if rect.left < -20000 || rect.top < -20000 || rect.right > 20000 || rect.bottom > 20000 {
                 return;
             }
             
@@ -555,7 +584,6 @@ impl RibbonTiler {
                                 LPARAM(0)
                             ).ok();
                             
-                            // Check if we need to trigger a ribbon recalc (every 500ms)
                             let now = Instant::now();
                             if now.duration_since(last_recalc_check).as_millis() > 500 {
                                 PostMessageW(
@@ -590,25 +618,18 @@ impl RibbonTiler {
 
     fn ribbon_to_screen(&self, pos: &RibbonPosition) -> RECT {
         let base_x = pos.x - self.ribbon_offset;
+        let base_y = pos.row * self.row_height - self.vertical_offset;
         
-        let (w, h) = match pos.size {
-            TileSize::Full => (self.monitor_width, self.monitor_height),
-            TileSize::HalfHorizontal => (self.monitor_width, self.monitor_height / 2),
-            TileSize::HalfVertical => (self.monitor_width / 2, self.monitor_height),
-            TileSize::Quarter => (self.monitor_width / 2, self.monitor_height / 2),
-        };
-
-        let y = match (pos.size, pos.y) {
-            (TileSize::HalfHorizontal, 1) => self.monitor_height / 2,
-            (TileSize::Quarter, 1) => self.monitor_height / 2,
-            _ => 0,
+        let w = match pos.size {
+            TileSize::Full => self.monitor_width,
+            TileSize::Half => self.monitor_width / 2,
         };
 
         RECT {
             left: base_x + self.margin_horizontal / 2,
-            top: y + self.margin_vertical / 2,
+            top: base_y + self.margin_vertical / 2,
             right: base_x + w - self.margin_horizontal / 2,
-            bottom: y + h - self.margin_vertical / 2,
+            bottom: base_y + self.row_height - self.margin_vertical / 2,
         }
     }
 
@@ -671,7 +692,7 @@ impl RibbonTiler {
                 return true;
             }
 
-            println!("Window added to ribbon (pushed in at nearest edge)");
+            println!("Window added to ribbon (row {})", self.current_row);
             
             true
         }
@@ -733,14 +754,13 @@ impl RibbonTiler {
         }
     }
 
-    // NEW: Clean up windows that were closed externally
+    // Clean up windows that were closed externally
     fn clean_closed_windows(&mut self) {
         let mut closed_windows = Vec::new();
         
         unsafe {
             for (hwnd_val, _) in self.windows.iter() {
                 let hwnd = HWND(*hwnd_val);
-                // Check if window still exists and is visible
                 if !IsWindow(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() {
                     closed_windows.push(*hwnd_val);
                 }
@@ -748,7 +768,6 @@ impl RibbonTiler {
         }
         
         if !closed_windows.is_empty() {
-            //println!("\nDetected {} externally closed windows, removing from ribbon", closed_windows.len());
             for hwnd_val in &closed_windows {
                 self.windows.remove(hwnd_val);
             }
@@ -756,92 +775,114 @@ impl RibbonTiler {
         }
     }
 
-    // NEW: Recalculate entire ribbon layout
+    // Get all rows that have windows
+    fn get_active_rows(&self) -> Vec<i32> {
+        let mut rows: Vec<i32> = self.windows.values()
+            .map(|w| w.position.row)
+            .collect();
+        rows.sort();
+        rows.dedup();
+        rows
+    }
+
+    // Check if any row has a window at the given x position
+    fn is_x_position_occupied(&self, x: i32, width: i32) -> bool {
+        self.windows.values().any(|w| {
+            let window_start = w.position.x;
+            let window_end = w.position.x + self.get_tile_width(&w.position.size);
+            // Check if ranges overlap
+            !(x + width <= window_start || x >= window_end)
+        })
+    }
+
+    // Recalculate entire ribbon layout
     fn recalculate_ribbon(&mut self) {
-        // First clean up any windows that were closed externally
         self.clean_closed_windows();
         
         if self.windows.is_empty() {
             self.ribbon_offset = 0;
             self.ribbon_offset_target = 0;
-            //println!("\nRibbon is empty - no windows to manage");
+            self.vertical_offset = 0;
+            self.vertical_offset_target = 0;
             return;
         }
         
-        //println!("\nRecalculating ribbon layout...");
+        // Get all non-exiting windows grouped by row
+        let mut rows: HashMap<i32, Vec<(isize, RibbonPosition)>> = HashMap::new();
         
-        // Get all non-exiting windows sorted by current x position
-        let mut windows: Vec<(isize, RibbonPosition)> = self.windows.iter()
-            .filter(|(_, w)| {
-                w.animation.as_ref().map_or(true, |a| a.animation_type != AnimationType::Exit)
-            })
-            .map(|(hwnd, w)| (*hwnd, w.position))
-            .collect();
+        for (hwnd, w) in self.windows.iter() {
+            if w.animation.as_ref().map_or(true, |a| a.animation_type != AnimationType::Exit) {
+                rows.entry(w.position.row)
+                    .or_insert_with(Vec::new)
+                    .push((*hwnd, w.position));
+            }
+        }
         
-        //println!("Found {} active windows in ribbon", windows.len());
+        // Sort each row by x position
+        for windows in rows.values_mut() {
+            windows.sort_by_key(|(_, pos)| pos.x);
+        }
         
-        // Sort by the current x position to maintain relative order
-        windows.sort_by_key(|(_, pos)| pos.x);
+        // Find all unique x positions across all rows
+        let mut x_positions: Vec<(i32, i32)> = Vec::new(); // (x, width)
         
-        // Debug: print current positions before recalc
-        //println!("Current window positions:");
-        //for (i, (hwnd, pos)) in windows.iter().enumerate() {
-        //    println!("  Window {}: x={}, width={}", i, pos.x, self.get_tile_width(&pos.size));
-        //}
+        for windows in rows.values() {
+            for (_, pos) in windows {
+                x_positions.push((pos.x, self.get_tile_width(&pos.size)));
+            }
+        }
         
-        // Reposition all windows starting from x=0, closing all gaps
+        // Sort and deduplicate x positions
+        x_positions.sort_by_key(|(x, _)| *x);
+        
+        // Build a new layout with no gaps
+        let mut new_x_mapping: HashMap<i32, i32> = HashMap::new();
         let mut current_x = 0;
-        let mut positions_to_update = Vec::new();
-        let mut position_changes = Vec::new();
         
-        for (hwnd, old_position) in windows {
-            let width = self.get_tile_width(&old_position.size);
-            
-            if let Some(window) = self.windows.get_mut(&hwnd) {
-                let old_x = window.position.x;
-                
-                // Update position to close gaps
-                window.position.x = current_x;
-                // Keep y and size from the old position
-                window.position.y = old_position.y;
-                window.position.size = old_position.size;
-                
-                if old_x != current_x {
-                    position_changes.push((hwnd, old_x, current_x));
+        for (old_x, width) in x_positions {
+            if !new_x_mapping.contains_key(&old_x) {
+                new_x_mapping.insert(old_x, current_x);
+                // Only advance if this x position is actually used
+                if self.is_x_position_occupied(old_x, width) {
+                    current_x += width;
                 }
+            }
+        }
+        
+        // Update all window positions
+        let mut positions_to_update = Vec::new();
+        
+        for (_hwnd, window) in self.windows.iter_mut() {
+            if let Some(&new_x) = new_x_mapping.get(&window.position.x) {
+                window.position.x = new_x;
                 
-                // Store windows that need visual position updates
-                if window.animation.is_none() {
+                if window.animation.is_none() && window.position.row == self.current_row {
                     positions_to_update.push((window.hwnd, window.position));
                 }
             }
-            
-            current_x += width;
         }
         
-        let total_width = current_x;
-        
-        // Apply position updates after mutable borrows are done
+        // Apply position updates
         for (hwnd, position) in positions_to_update {
             let rect = self.ribbon_to_screen(&position);
             Self::set_window_rect(hwnd, &rect);
         }
         
         // Ensure ribbon offset is within bounds
-        let max_offset = (total_width - self.monitor_width).max(0);
+        let max_x = self.windows.values()
+            .map(|w| w.position.x + self.get_tile_width(&w.position.size))
+            .max()
+            .unwrap_or(0);
+        let max_offset = (max_x - self.monitor_width).max(0);
+        
         if self.ribbon_offset > max_offset {
             self.ribbon_offset = max_offset;
             self.ribbon_offset_target = max_offset;
-            self.ribbon_offset_animation = None;
+            self.scroll_animation = None;
         }
         
         self.needs_ribbon_recalc = false;
         self.last_ribbon_recalc = Instant::now();
-    }
-    
-    // Clamp ribbon offset to valid bounds (simplified - just triggers recalc)
-    fn clamp_ribbon_offset(&mut self) {
-        self.needs_ribbon_recalc = true;
     }
 
     fn reflow_ribbon(&mut self) {
@@ -887,7 +928,6 @@ impl RibbonTiler {
                 rect.bottom = rect.top + height;
             }
             
-            // Remove minimize/maximize functionality
             if IsZoomed(hwnd).as_bool() {
                 ShowWindow(hwnd, SW_RESTORE);
             }
@@ -914,8 +954,9 @@ impl RibbonTiler {
             let new_window_width = self.get_tile_width(&position.size);
             let insertion_x = position.x;
             
+            // Shift windows on the same row
             let windows_to_shift: Vec<isize> = self.windows.iter()
-                .filter(|(h, w)| **h != hwnd.0 && w.position.x >= insertion_x)
+                .filter(|(h, w)| **h != hwnd.0 && w.position.row == position.row && w.position.x >= insertion_x)
                 .map(|(h, _)| *h)
                 .collect();
                 
@@ -937,12 +978,14 @@ impl RibbonTiler {
                 
                 self.ribbon_offset = center_offset.clamp(0, max_offset);
                 self.ribbon_offset_target = self.ribbon_offset;
+                self.vertical_offset = self.current_row * self.row_height;
+                self.vertical_offset_target = self.vertical_offset;
             }
             
             self.apply_window_position_with_animation_type(hwnd, AnimationType::Entry);
             
             let shifted_hwnds: Vec<HWND> = self.windows.iter()
-                .filter(|(h, w)| **h != hwnd.0 && w.position.x >= insertion_x + new_window_width)
+                .filter(|(h, w)| **h != hwnd.0 && w.position.row == position.row && w.position.x >= insertion_x + new_window_width)
                 .map(|(_, w)| w.hwnd)
                 .collect();
             
@@ -965,7 +1008,8 @@ impl RibbonTiler {
         let mut best_position = self.ribbon_offset;
         let mut best_distance = i32::MAX;
         
-        for window in self.windows.values() {
+        // Only check windows on the current row
+        for window in self.windows.values().filter(|w| w.position.row == self.current_row) {
             let left_edge = window.position.x;
             let right_edge = window.position.x + self.get_tile_width(&window.position.size);
             
@@ -984,8 +1028,8 @@ impl RibbonTiler {
         
         RibbonPosition {
             x: best_position,
-            y: 0,
-            size: TileSize::HalfVertical,
+            row: self.current_row,
+            size: TileSize::Half,
         }
     }
 
@@ -1139,6 +1183,10 @@ impl RibbonTiler {
         self.windows.clear();
         self.ribbon_offset = 0;
         self.ribbon_offset_target = 0;
+        self.vertical_offset = 0;
+        self.vertical_offset_target = 0;
+        self.current_row = 0;
+        self.scroll_animation = None;
         
         for (_, hwnd) in &self.floating_windows {
             unsafe {
@@ -1250,6 +1298,8 @@ impl RibbonTiler {
                 if animation_type == AnimationType::Entry {
                     current_rect = target_rect;
                     ShowWindow(hwnd, SW_RESTORE);
+                } else if position.row == self.current_row {
+                    ShowWindow(hwnd, SW_RESTORE);
                 }
                 
                 let duration = match animation_type {
@@ -1274,6 +1324,7 @@ impl RibbonTiler {
 
     fn find_next_free_position(&self) -> RibbonPosition {
         let max_x = self.windows.values()
+            .filter(|w| w.position.row == self.current_row)
             .map(|w| w.position.x + self.get_tile_width(&w.position.size))
             .max()
             .unwrap_or(0);
@@ -1286,17 +1337,15 @@ impl RibbonTiler {
 
         RibbonPosition {
             x,
-            y: 0,
-            size: TileSize::HalfVertical,
+            row: self.current_row,
+            size: TileSize::Half,
         }
     }
 
     fn get_tile_width(&self, size: &TileSize) -> i32 {
         match size {
             TileSize::Full => self.monitor_width,
-            TileSize::HalfHorizontal => self.monitor_width,
-            TileSize::HalfVertical => self.monitor_width / 2,
-            TileSize::Quarter => self.monitor_width / 2,
+            TileSize::Half => self.monitor_width / 2,
         }
     }
 
@@ -1313,39 +1362,15 @@ impl RibbonTiler {
 
         if let Some(window) = self.windows.get(&hwnd.0).cloned() {
             let old_size = window.position.size;
-            let old_y = window.position.y;
             
-            let (new_size, new_y) = match (old_size, old_y, direction) {
-                // From Full
-                (TileSize::Full, _, Direction::Left | Direction::Right) => (TileSize::HalfVertical, 0),
-                (TileSize::Full, _, Direction::Up) => (TileSize::HalfHorizontal, 0),
-                (TileSize::Full, _, Direction::Down) => (TileSize::HalfHorizontal, 1),
-                
-                // From HalfHorizontal
-                (TileSize::HalfHorizontal, 0, Direction::Up) => (TileSize::HalfHorizontal, 0),
-                (TileSize::HalfHorizontal, 0, Direction::Down) => (TileSize::Full, 0),
-                (TileSize::HalfHorizontal, 1, Direction::Up) => (TileSize::Full, 0),
-                (TileSize::HalfHorizontal, 1, Direction::Down) => (TileSize::HalfHorizontal, 1),
-                (TileSize::HalfHorizontal, y, Direction::Left | Direction::Right) => (TileSize::Quarter, y),
-                
-                // From HalfVertical
-                (TileSize::HalfVertical, _, Direction::Up) => (TileSize::Quarter, 0),
-                (TileSize::HalfVertical, _, Direction::Down) => (TileSize::Quarter, 1),
-                (TileSize::HalfVertical, _, Direction::Left | Direction::Right) => (TileSize::Full, 0),
-                
-                // From Quarter
-                (TileSize::Quarter, 0, Direction::Up) => (TileSize::Quarter, 0),
-                (TileSize::Quarter, 0, Direction::Down) => (TileSize::HalfVertical, 0),
-                (TileSize::Quarter, 1, Direction::Up) => (TileSize::HalfVertical, 0),
-                (TileSize::Quarter, 1, Direction::Down) => (TileSize::Quarter, 1),
-                (TileSize::Quarter, y, Direction::Left | Direction::Right) => (TileSize::HalfHorizontal, y),
-                
-                _ => (old_size, old_y),
+            let new_size = match (old_size, direction) {
+                (TileSize::Full, Direction::Left | Direction::Right) => TileSize::Half,
+                (TileSize::Half, Direction::Left | Direction::Right) => TileSize::Full,
+                _ => old_size,
             };
             
             if let Some(w) = self.windows.get_mut(&hwnd.0) {
                 w.position.size = new_size;
-                w.position.y = new_y;
             }
             
             self.pull_adjacent_windows(hwnd.0);
@@ -1359,6 +1384,7 @@ impl RibbonTiler {
         self.needs_ribbon_recalc = true;
     }
 
+    // Move window between rows or swap positions
     fn move_window(&mut self, hwnd: HWND, direction: Direction) {
         self.check_monitor_dimensions();
         self.clean_closed_windows();
@@ -1368,6 +1394,11 @@ impl RibbonTiler {
             return;
         }
 
+        // Clear any existing animation on the focused window
+        if let Some(window) = self.windows.get_mut(&hwnd.0) {
+            window.animation = None;
+        }
+
         let current_pos = match self.windows.get(&hwnd.0) {
             Some(w) => w.position,
             None => return,
@@ -1375,95 +1406,195 @@ impl RibbonTiler {
         
         match direction {
             Direction::Up | Direction::Down => {
-                if current_pos.size == TileSize::Quarter {
-                    if let Some(window) = self.windows.get_mut(&hwnd.0) {
-                        window.position.y = 1 - window.position.y;
+                let old_row = current_pos.row;
+                let new_row = match direction {
+                    Direction::Up => {
+                        if current_pos.row > 0 {
+                            current_pos.row - 1
+                        } else {
+                            return;
+                        }
+                    },
+                    Direction::Down => current_pos.row + 1,
+                    _ => unreachable!(),
+                };
+                
+                let current_width = self.get_tile_width(&current_pos.size);
+                let current_x = current_pos.x;
+                let current_end = current_x + current_width;
+                
+                // Check if the target position is empty
+                let mut is_empty = true;
+                let mut blocking_windows = Vec::new();
+                
+                for (other_hwnd, window) in self.windows.iter() {
+                    if window.position.row == new_row {
+                        let other_x = window.position.x;
+                        let other_width = self.get_tile_width(&window.position.size);
+                        let other_end = other_x + other_width;
+                        
+                        // Check if this window overlaps with our target position
+                        if !(current_end <= other_x || current_x >= other_end) {
+                            is_empty = false;
+                            blocking_windows.push((*other_hwnd, other_x, other_width));
+                        }
                     }
-                    self.apply_all_windows(true);
+                }
+                
+                // Store old positions for animation
+                let old_ribbon_offset = self.ribbon_offset;
+                let old_vertical_offset = self.vertical_offset;
+                
+                if is_empty {
+                    // Just move to the empty space
+                    if let Some(window) = self.windows.get_mut(&hwnd.0) {
+                        window.position.row = new_row;
+                    }
+                } else {
+                    // Need to swap or shift windows
+                    blocking_windows.sort_by_key(|(_, x, _)| *x);
+                    
+                    // Shift blocking windows to make room
+                    for (other_hwnd, _, _) in &blocking_windows {
+                        if let Some(w) = self.windows.get_mut(other_hwnd) {
+                            w.position.x += current_width;
+                        }
+                    }
+                    
+                    // Move the current window to the new row
+                    if let Some(window) = self.windows.get_mut(&hwnd.0) {
+                        window.position.row = new_row;
+                    }
+                }
+                
+                // Update viewport to keep focused window stationary
+                let row_diff = new_row - old_row;
+                self.current_row = new_row;
+                self.vertical_offset = old_vertical_offset + row_diff * self.row_height;
+                self.vertical_offset_target = self.vertical_offset;
+                
+                // Start smooth universe movement
+                self.animate_universe_movement(hwnd, old_ribbon_offset, old_vertical_offset);
+                
+                self.needs_ribbon_recalc = true;
+                
+                unsafe {
+                    SetForegroundWindow(hwnd);
                 }
             },
             Direction::Left | Direction::Right => {
-                if let Some(window) = self.windows.get_mut(&hwnd.0) {
-                    window.animation = None;
-                }
-                
-                let focused_screen_x = current_pos.x - self.ribbon_offset;
-                
-                let mut windows: Vec<(isize, i32)> = self.windows.iter()
-                    .map(|(h, w)| (*h, w.position.x))
+                // Get windows on the same row
+                let mut windows_on_row: Vec<(isize, i32, i32)> = self.windows.iter()
+                    .filter(|(_, w)| w.position.row == current_pos.row)
+                    .map(|(h, w)| (*h, w.position.x, self.get_tile_width(&w.position.size)))
                     .collect();
-                windows.sort_by_key(|(_, x)| *x);
+                windows_on_row.sort_by_key(|(_, x, _)| *x);
                 
-                let current_index = windows.iter().position(|(h, _)| *h == hwnd.0);
+                let current_index = windows_on_row.iter().position(|(h, _, _)| *h == hwnd.0);
                 if current_index.is_none() {
                     return;
                 }
                 let current_index = current_index.unwrap();
                 
-                match direction {
-                    Direction::Left if current_index == 0 => return,
-                    Direction::Right if current_index == windows.len() - 1 => return,
-                    _ => {}
-                }
+                let current_width = self.get_tile_width(&current_pos.size);
+                let old_x = current_pos.x;
+                let mut new_x = old_x;
+                let mut do_swap = false;
+                let mut swap_hwnd: Option<isize> = None;
                 
                 match direction {
                     Direction::Left => {
-                        let (left_hwnd, left_x) = windows[current_index - 1];
-                        let (_current_hwnd, current_x) = windows[current_index];
-                        
-                        if let Some(left_window) = self.windows.get_mut(&left_hwnd) {
-                            left_window.position.x = current_x;
+                        if current_index == 0 {
+                            // Moving into empty space at the beginning
+                            new_x = 0;
+                        } else {
+                            let (left_hwnd, left_x, left_width) = windows_on_row[current_index - 1];
+                            let gap_start = left_x + left_width;
+                            let gap_size = old_x - gap_start;
+                            
+                            if gap_size > 0 {
+                                // Move into the gap
+                                new_x = gap_start;
+                            } else {
+                                // Swap with left window
+                                do_swap = true;
+                                swap_hwnd = Some(left_hwnd);
+                                new_x = left_x;
+                            }
                         }
-                        if let Some(current_window) = self.windows.get_mut(&hwnd.0) {
-                            current_window.position.x = left_x;
-                        }
-                        
-                        self.ribbon_offset = left_x - focused_screen_x;
-                        self.needs_ribbon_recalc = true;
                     },
                     Direction::Right => {
-                        let (_current_hwnd, current_x) = windows[current_index];
-                        let (right_hwnd, right_x) = windows[current_index + 1];
-                        
-                        if let Some(right_window) = self.windows.get_mut(&right_hwnd) {
-                            right_window.position.x = current_x;
+                        if current_index == windows_on_row.len() - 1 {
+                            // Moving into empty space at the end
+                            new_x = old_x + current_width;
+                        } else {
+                            let (right_hwnd, right_x, right_width) = windows_on_row[current_index + 1];
+                            let gap_size = right_x - (old_x + current_width);
+                            
+                            if gap_size > 0 {
+                                // Move into the gap
+                                new_x = right_x - current_width;
+                            } else {
+                                // Swap with right window
+                                do_swap = true;
+                                swap_hwnd = Some(right_hwnd);
+                                new_x = right_x;
+                            }
                         }
-                        if let Some(current_window) = self.windows.get_mut(&hwnd.0) {
-                            current_window.position.x = right_x;
-                        }
-                        
-                        self.ribbon_offset = right_x - focused_screen_x;
-                        self.needs_ribbon_recalc = true;
                     },
                     _ => unreachable!(),
                 }
                 
+                // Calculate actual movement distance
+                let movement_distance = new_x - old_x;
+                
+                if movement_distance == 0 {
+                    return; // No movement needed
+                }
+                
+                // Store old offset for animation
+                let old_ribbon_offset = self.ribbon_offset;
+                let old_vertical_offset = self.vertical_offset;
+                
+                // Update positions
+                if do_swap && swap_hwnd.is_some() {
+                    let swap_hwnd = swap_hwnd.unwrap();
+                    
+                    if let Some(other_window) = self.windows.get(&swap_hwnd) {
+                        let other_x = other_window.position.x;
+                        
+                        // Swap positions
+                        if let Some(w) = self.windows.get_mut(&hwnd.0) {
+                            w.position.x = other_x;
+                        }
+                        if let Some(w) = self.windows.get_mut(&swap_hwnd) {
+                            w.position.x = old_x;
+                        }
+                    }
+                } else {
+                    // Just move to new position
+                    if let Some(w) = self.windows.get_mut(&hwnd.0) {
+                        w.position.x = new_x;
+                    }
+                }
+                
+                // Update ribbon offset to keep focused window stationary
+                self.ribbon_offset = old_ribbon_offset + movement_distance;
+                self.ribbon_offset_target = self.ribbon_offset;
+                
+                // Clamp to valid bounds
                 let max_x = self.windows.values()
                     .map(|w| w.position.x + self.get_tile_width(&w.position.size))
                     .max()
                     .unwrap_or(0);
                 let max_offset = (max_x - self.monitor_width).max(0);
-                
                 self.ribbon_offset = self.ribbon_offset.clamp(0, max_offset);
                 self.ribbon_offset_target = self.ribbon_offset;
                 
-                self.ribbon_offset_animation = None;
+                // Start smooth universe movement
+                self.animate_universe_movement(hwnd, old_ribbon_offset, old_vertical_offset);
                 
-                if let Some(window) = self.windows.get(&hwnd.0) {
-                    let rect = self.ribbon_to_screen(&window.position);
-                    Self::set_window_rect(hwnd, &rect);
-                }
-                
-                let other_hwnds: Vec<HWND> = self.windows.iter()
-                    .filter(|(h, _)| **h != hwnd.0)
-                    .map(|(_, w)| w.hwnd)
-                    .collect();
-                    
-                for other_hwnd in other_hwnds {
-                    self.apply_window_position(other_hwnd, true);
-                }
-                
-                self.start_animation_timer();
+                self.needs_ribbon_recalc = true;
                 
                 unsafe {
                     SetForegroundWindow(hwnd);
@@ -1471,38 +1602,130 @@ impl RibbonTiler {
             }
         }
     }
+    
+    // Smoothly animate universe movement from old viewport to new viewport
+    fn animate_universe_movement(&mut self, focused_hwnd: HWND, old_ribbon_offset: i32, old_vertical_offset: i32) {
+        // Extract values we'll need in the loop
+        let new_ribbon_offset = self.ribbon_offset;
+        let new_vertical_offset = self.vertical_offset;
+        let margin_h = self.margin_horizontal;
+        let margin_v = self.margin_vertical;
+        let row_height = self.row_height;
+        let monitor_width = self.monitor_width;
+        
+        // For each window, calculate where it would be with the OLD viewport
+        // and where it should be with the NEW viewport, then animate between them
+        for (hwnd_val, window) in self.windows.iter_mut() {
+            if *hwnd_val == focused_hwnd.0 {
+                // The focused window doesn't move
+                continue;
+            }
+            
+            // Get tile width before we need it
+            let tile_width = match window.position.size {
+                TileSize::Full => monitor_width,
+                TileSize::Half => monitor_width / 2,
+            };
+            
+            // Calculate old screen position (with old viewport)
+            let old_screen_x = window.position.x - old_ribbon_offset;
+            let old_screen_y = window.position.row * row_height - old_vertical_offset;
+            
+            // Calculate new screen position (with new viewport)
+            let new_screen_x = window.position.x - new_ribbon_offset;
+            let new_screen_y = window.position.row * row_height - new_vertical_offset;
+            
+            // If there's already an animation in progress, we need to handle it carefully
+            let start_rect = if let Some(existing_anim) = &window.animation {
+                // Use the current interpolated position as the start
+                let elapsed = Instant::now().duration_since(existing_anim.start_time);
+                let t = (elapsed.as_secs_f32() / existing_anim.duration.as_secs_f32()).min(1.0);
+                let eased_t = Self::ease_out_cubic(t);
+                
+                RECT {
+                    left: Self::lerp(existing_anim.start_rect.left, existing_anim.target_rect.left, eased_t),
+                    top: Self::lerp(existing_anim.start_rect.top, existing_anim.target_rect.top, eased_t),
+                    right: Self::lerp(existing_anim.start_rect.right, existing_anim.target_rect.right, eased_t),
+                    bottom: Self::lerp(existing_anim.start_rect.bottom, existing_anim.target_rect.bottom, eased_t),
+                }
+            } else {
+                // Use the old screen position
+                RECT {
+                    left: old_screen_x + margin_h / 2,
+                    top: old_screen_y + margin_v / 2,
+                    right: old_screen_x + tile_width - margin_h / 2,
+                    bottom: old_screen_y + row_height - margin_v / 2,
+                }
+            };
+            
+            // Target is the new screen position
+            let target_rect = RECT {
+                left: new_screen_x + margin_h / 2,
+                top: new_screen_y + margin_v / 2,
+                right: new_screen_x + tile_width - margin_h / 2,
+                bottom: new_screen_y + row_height - margin_v / 2,
+            };
+            
+            // Create smooth animation
+            window.animation = Some(AnimationState {
+                start_rect,
+                target_rect,
+                start_time: Instant::now(),
+                duration: Duration::from_millis(200),
+                animation_type: AnimationType::Move,
+            });
+        }
+        
+        self.start_animation_timer();
+    }
 
     fn recalculate_positions_for_new_resolution(&mut self, old_width: i32) {
         if self.windows.is_empty() {
             return;
         }
         
-        let mut windows: Vec<(isize, RibbonPosition)> = self.windows.iter()
-            .map(|(hwnd, w)| (*hwnd, w.position))
-            .collect();
-        windows.sort_by_key(|(_, pos)| pos.x);
-        
         let scale_factor = self.monitor_width as f32 / old_width as f32;
         
-        let mut current_x = 0;
-        for (hwnd, old_pos) in windows {
-            if let Some(window) = self.windows.get_mut(&hwnd) {
-                window.position.x = current_x;
-                window.position.y = old_pos.y;
-                window.position.size = old_pos.size;
-                
-                current_x += self.get_tile_width(&old_pos.size);
+        // Recalculate row height
+        self.row_height = self.monitor_height;
+        
+        // Group windows by row
+        let mut rows: HashMap<i32, Vec<(isize, RibbonPosition)>> = HashMap::new();
+        for (hwnd, w) in self.windows.iter() {
+            rows.entry(w.position.row)
+                .or_insert_with(Vec::new)
+                .push((*hwnd, w.position));
+        }
+        
+        // Process each row
+        for (row, mut windows) in rows {
+            windows.sort_by_key(|(_, pos)| pos.x);
+            
+            let mut current_x = 0;
+            for (hwnd, old_pos) in windows {
+                if let Some(window) = self.windows.get_mut(&hwnd) {
+                    window.position.x = current_x;
+                    window.position.row = row;
+                    window.position.size = old_pos.size;
+                    
+                    current_x += self.get_tile_width(&old_pos.size);
+                }
             }
         }
         
         self.ribbon_offset = (self.ribbon_offset as f32 * scale_factor) as i32;
         self.ribbon_offset_target = self.ribbon_offset;
+        self.vertical_offset = self.current_row * self.row_height;
+        self.vertical_offset_target = self.vertical_offset;
         
         self.needs_ribbon_recalc = true;
     }
 
     fn apply_all_windows(&mut self, animate: bool) {
-        let hwnds: Vec<HWND> = self.windows.values().map(|w| w.hwnd).collect();
+        let hwnds: Vec<HWND> = self.windows.values()
+            .map(|w| w.hwnd)
+            .collect();
+        
         for hwnd in hwnds {
             self.apply_window_position(hwnd, animate);
         }
@@ -1522,8 +1745,6 @@ impl RibbonTiler {
             let old_width = self.monitor_width;
             self.monitor_width = new_width;
             self.monitor_height = new_height;
-            
-            //println!("Monitor resolution changed: {}x{} -> {}x{}", old_width, self.monitor_height, new_width, new_height);
             
             self.recalculate_positions_for_new_resolution(old_width);
             
@@ -1545,14 +1766,14 @@ impl RibbonTiler {
             .unwrap_or(0);
         let max_offset = (max_x - self.monitor_width).max(0);
         
+        // Check if we're already at the edge
         match direction {
             Direction::Left if self.ribbon_offset_target <= 0 => return,
             Direction::Right if self.ribbon_offset_target >= max_offset => return,
-            _ => {}
+            _ => {},
         }
         
         let snap_distance = self.monitor_width / 2;
-        let old_target = self.ribbon_offset_target;
         
         match direction {
             Direction::Left => {
@@ -1564,39 +1785,103 @@ impl RibbonTiler {
             _ => return,
         }
         
-        if self.ribbon_offset_target != old_target {
-            self.ribbon_offset_animation = Some((
-                Instant::now(),
-                self.ribbon_offset,
-                self.ribbon_offset_target
-            ));
-            
-            self.start_animation_timer();
-            self.focus_visible_window();
-        }
+        self.start_scroll_animation();
+    }
+    
+    // Pan between rows
+    fn pan_row(&mut self, direction: Direction) {
+        self.check_monitor_dimensions();
+        self.clean_closed_windows();
+        
+        // Get the maximum row that has windows
+        let max_row_with_windows = self.windows.values()
+            .map(|w| w.position.row)
+            .max()
+            .unwrap_or(0);
+        
+        // Allow panning one row beyond the last window row (for empty space)
+        // but no further
+        let max_allowed_row = max_row_with_windows + 1;
+        
+        match direction {
+            Direction::Up => {
+                if self.current_row > 0 {
+                    self.current_row -= 1;
+                    self.vertical_offset_target = self.current_row * self.row_height;
+                    println!("Targeting row {}", self.current_row);
+                    self.start_scroll_animation();
+                }
+            },
+            Direction::Down => {
+                if self.current_row < max_allowed_row {
+                    self.current_row += 1;
+                    self.vertical_offset_target = self.current_row * self.row_height;
+                    println!("Targeting row {}", self.current_row);
+                    self.start_scroll_animation();
+                }
+            },
+            _ => return,
+        };
+    }
+    
+    // Start or update scroll animation to current targets
+    fn start_scroll_animation(&mut self) {
+        // If we're already animating, just update the targets
+        // The animation will smoothly interpolate to the new destination
+        
+        // Clamp targets to valid bounds
+        let max_row = self.windows.values()
+            .map(|w| w.position.row)
+            .max()
+            .unwrap_or(0);
+        let max_vertical = max_row * self.row_height;
+        self.vertical_offset_target = self.vertical_offset_target.clamp(0, max_vertical);
+        
+        let max_x = self.windows.values()
+            .map(|w| w.position.x + self.get_tile_width(&w.position.size))
+            .max()
+            .unwrap_or(0);
+        let max_horizontal = (max_x - self.monitor_width).max(0);
+        self.ribbon_offset_target = self.ribbon_offset_target.clamp(0, max_horizontal);
+        
+        // Start new animation from current position to target
+        self.scroll_animation = Some(ScrollAnimation {
+            start_x: self.ribbon_offset,
+            start_y: self.vertical_offset,
+            target_x: self.ribbon_offset_target,
+            target_y: self.vertical_offset_target,
+            start_time: Instant::now(),
+            duration: Duration::from_millis(200), // Smooth animation duration
+        });
+        
+        self.start_animation_timer();
     }
     
     fn focus_visible_window(&self) {
         unsafe {
-            let target_offset = self.ribbon_offset_target;
-            
             let mut best_window: Option<HWND> = None;
-            let mut best_distance = i32::MAX;
+            let mut best_distance = f32::MAX;
+            
+            let screen_center_x = self.monitor_width as f32 / 2.0;
+            let screen_center_y = self.monitor_height as f32 / 2.0;
             
             for window in self.windows.values() {
-                let window_start = window.position.x;
-                let window_width = self.get_tile_width(&window.position.size);
-                let window_end = window_start + window_width;
-                let window_center = window_start + window_width / 2;
+                if !self.is_window_visible(&window.position) {
+                    continue;
+                }
                 
-                if window_end > target_offset && window_start < target_offset + self.monitor_width {
-                    let screen_center = target_offset + self.monitor_width / 2;
-                    let distance = (window_center - screen_center).abs();
-                    
-                    if distance < best_distance {
-                        best_distance = distance;
-                        best_window = Some(window.hwnd);
-                    }
+                let rect = self.ribbon_to_screen(&window.position);
+                let window_center_x = ((rect.left + rect.right) / 2) as f32;
+                let window_center_y = ((rect.top + rect.bottom) / 2) as f32;
+                
+                // Calculate distance from screen center
+                let dx = window_center_x - screen_center_x;
+                let dy = window_center_y - screen_center_y;
+                let distance = (dx * dx + dy * dy).sqrt();
+                
+                if distance < best_distance {
+                    best_distance = distance;
+                    best_window = Some(window.hwnd);
                 }
             }
             
@@ -1630,7 +1915,6 @@ impl RibbonTiler {
     fn adjust_margins(&mut self, delta: i32) {
         self.margin_horizontal = (self.margin_horizontal as i32 + delta).clamp(0, 200) as i32;
         self.margin_vertical = (self.margin_vertical as i32 + delta * 2).clamp(0, 200) as i32;
-        //println!("Window margins: H:{}px V:{}px", self.margin_horizontal, self.margin_vertical);
         
         self.apply_all_windows(false);
     }
@@ -1642,21 +1926,23 @@ impl RibbonTiler {
             120 => 144,
             _ => 60,
         };
-        //println!("Animation FPS: {} ({}ms frame interval)", self.animation_fps, 1000 / self.animation_fps);
     }
     
     fn scroll_to_window(&mut self, hwnd: HWND) {
         self.check_monitor_dimensions();
         
         if let Some(window) = self.windows.get(&hwnd.0) {
+            // Extract values before mutable operations
+            let window_row = window.position.row;
             let window_x = window.position.x;
-            let window_width = self.get_tile_width(&window.position.size);
-            let window_end = window_x + window_width;
+            let window_size = window.position.size;
             
-            if window_x >= self.ribbon_offset && window_end <= self.ribbon_offset + self.monitor_width {
-                return;
-            }
+            // Set both vertical and horizontal targets
+            self.current_row = window_row;
+            self.vertical_offset_target = window_row * self.row_height;
             
+            // Center the window horizontally
+            let window_width = self.get_tile_width(&window_size);
             let center_offset = window_x + window_width / 2 - self.monitor_width / 2;
             
             let max_x = self.windows.values()
@@ -1667,13 +1953,8 @@ impl RibbonTiler {
             
             self.ribbon_offset_target = center_offset.clamp(0, max_offset);
             
-            self.ribbon_offset_animation = Some((
-                Instant::now(),
-                self.ribbon_offset,
-                self.ribbon_offset_target
-            ));
-            
-            self.start_animation_timer();
+            // Start animation to both targets
+            self.start_scroll_animation();
         }
     }
 }
@@ -1691,7 +1972,7 @@ static TILER: Mutex<Option<Arc<Mutex<RibbonTiler>>>> = Mutex::new(None);
 static MAIN_HWND: AtomicUsize = AtomicUsize::new(0);
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-// Keyboard hook procedure - MUST BE FAST!
+// Keyboard hook procedure
 unsafe extern "system" fn keyboard_hook_proc(
     code: i32,
     wparam: WPARAM,
@@ -1731,13 +2012,8 @@ unsafe extern "system" fn keyboard_hook_proc(
         
         if win && !ctrl && !shift && !alt {
             match vk_code {
-                VK_UP | VK_DOWN => return LRESULT(1),
-                _ => {},
-            }
-        }
-        
-        if win && !ctrl && !shift && !alt {
-            match vk_code {
+                VK_UP => command = Some(TilerCommand::PanUp),
+                VK_DOWN => command = Some(TilerCommand::PanDown),
                 VK_LEFT => command = Some(TilerCommand::PanLeft),
                 VK_RIGHT => command = Some(TilerCommand::PanRight),
                 VIRTUAL_KEY(0x43) => command = Some(TilerCommand::ForceRecalc), // C for Clean
@@ -1747,8 +2023,6 @@ unsafe extern "system" fn keyboard_hook_proc(
 
         if win && ctrl && !shift && !alt {
             match vk_code {
-                VK_UP => command = Some(TilerCommand::ResizeUp),
-                VK_DOWN => command = Some(TilerCommand::ResizeDown),
                 VK_LEFT => command = Some(TilerCommand::ResizeLeft),
                 VK_RIGHT => command = Some(TilerCommand::ResizeRight),
                 _ => {},
@@ -1827,19 +2101,19 @@ extern "system" fn console_handler(ctrl_type: u32) -> BOOL {
 
 fn main() -> Result<()> {
     println!("╔═══════════════════════════════════════════════╗");
-    println!("║             THYMELINE TILER v2.7.1            ║");
+    println!("║     THYMELINE TILER v3.1 - Smooth Scrolling    ║");
     println!("╚═══════════════════════════════════════════════╝");
     println!("\n🎯 WINDOW MANAGEMENT:");
     println!("  Win+Shift+T          Add current window to ribbon");
     println!("  Win+Shift+R          Remove current window from ribbon");
     println!("  Win+C                Force cleanup and recalculation");
     println!("\n📐 WINDOW RESIZING:");
-    println!("  Win+Ctrl+Arrow       Resize window");
-    println!("  Win+Up/Down          (Disabled - no maximize/minimize)");
+    println!("  Win+Ctrl+Left/Right  Toggle between full/half width");
     println!("\n🔀 WINDOW MOVEMENT:");
-    println!("  Win+Ctrl+Shift+Arrow Move/shuffle windows");
+    println!("  Win+Ctrl+Shift+Arrow Move windows (up/down changes rows)");
     println!("\n📍 RIBBON NAVIGATION:");
-    println!("  Win+Left/Right       Pan through ribbon");
+    println!("  Win+Left/Right       Pan horizontally through ribbon");
+    println!("  Win+Up/Down          Switch between rows");
     println!("  Win+S                Scroll to current window");
     println!("\n🎨 APPEARANCE:");
     println!("  Win+(Shift+)Plus     Increase transparency");
@@ -1870,8 +2144,6 @@ fn main() -> Result<()> {
             0,
         )?;
 
-        //println!("\n✅ Thymeline ready! (v2.7.1 - Smart ribbon with closed window detection)");
-
         let mut msg = MSG::default();
         loop {
             let result = GetMessageW(&mut msg, HWND::default(), 0, 0);
@@ -1888,7 +2160,6 @@ fn main() -> Result<()> {
             } else if msg.message == WM_TILER_RECALC {
                 if let Some(tiler_arc) = TILER.lock().unwrap().as_ref() {
                     if let Ok(mut tiler) = tiler_arc.lock() {
-                        // Always clean closed windows when we check for recalc
                         tiler.clean_closed_windows();
                         
                         if tiler.needs_ribbon_recalc {
@@ -1908,8 +2179,8 @@ fn main() -> Result<()> {
                         let command = match command_value {
                             0 => TilerCommand::PanLeft,
                             1 => TilerCommand::PanRight,
-                            2 => TilerCommand::ResizeUp,
-                            3 => TilerCommand::ResizeDown,
+                            2 => TilerCommand::PanUp,
+                            3 => TilerCommand::PanDown,
                             4 => TilerCommand::ResizeLeft,
                             5 => TilerCommand::ResizeRight,
                             6 => TilerCommand::MoveUp,
@@ -1929,8 +2200,17 @@ fn main() -> Result<()> {
                         };
                         
                         match command {
-                            TilerCommand::PanLeft => tiler.pan_ribbon(Direction::Left),
-                            TilerCommand::PanRight => tiler.pan_ribbon(Direction::Right),
+                            TilerCommand::PanLeft | TilerCommand::PanRight | 
+                            TilerCommand::PanUp | TilerCommand::PanDown => {
+                                // Process pan commands immediately for smooth aggregation
+                                match command {
+                                    TilerCommand::PanLeft => tiler.pan_ribbon(Direction::Left),
+                                    TilerCommand::PanRight => tiler.pan_ribbon(Direction::Right),
+                                    TilerCommand::PanUp => tiler.pan_row(Direction::Up),
+                                    TilerCommand::PanDown => tiler.pan_row(Direction::Down),
+                                    _ => {},
+                                }
+                            },
                             _ => {
                                 tiler.queue_command(command, hwnd);
                                 tiler.process_command_queue();

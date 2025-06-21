@@ -1,0 +1,14 @@
+﻿*.autosave
+*.tmp
+target/
+Cargo.lock
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.env
+*.exe
+*.pdb
+*.log
+*.bak
+temp/
