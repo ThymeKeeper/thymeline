@@ -38,15 +38,13 @@ Thymeline is a Windows application that manages other application windows, arran
 ### Window Movement
 | Shortcut | Action |
 |----------|--------|
-| `Win+Ctrl+Shift+↑/↓` | Move window between rows |
-| `Win+Ctrl+Shift+←/→` | Reorder windows horizontally |
+| `Win+Ctrl+Shift+arrow` | Move focused tile |
 
 ### Navigation
 | Shortcut | Action |
 |----------|--------|
-| `Win+←/→` | Pan horizontally |
-| `Win+↑/↓` | Switch between rows |
-| `Win+S` | Scroll to current window |
+| `Win+arrow` | Pan view |
+| `Win+S` | Scroll to focused window |
 
 ### Appearance
 | Shortcut | Action |
@@ -60,7 +58,7 @@ Thymeline is a Windows application that manages other application windows, arran
 ### Exit
 | Shortcut | Action |
 |----------|--------|
-| `Ctrl+C` | Restore all windows and exit |
+| `Ctrl+C` | Restore all windows and exit (when the main terminal window is focused) |
 
 ## Building from Source
 
