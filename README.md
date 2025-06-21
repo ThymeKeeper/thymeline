@@ -49,8 +49,8 @@ Thymeline is a Windows application that manages other application windows, arran
 ### Appearance
 | Shortcut | Action |
 |----------|--------|
-| `Win+(Shift+)+` | Increase transparency |
-| `Win+(Shift+)-` | Decrease transparency |
+| `Win+[=]` | Increase transparency |
+| `Win+[-]` | Decrease transparency |
 | `Win+M` | Increase margins |
 | `Win+N` | Decrease margins |
 | `Win+F` | Cycle animation FPS |
