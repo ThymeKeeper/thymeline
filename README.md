@@ -1,12 +1,12 @@
-# Thymeline
+# WindowPots
 
 A window organizer for Windows that arranges application windows in a scrollable 2D grid with smooth animations.
 
 ![thymeline demo vid](https://github.com/user-attachments/assets/2cff35d6-beba-4fc5-92e3-7b95d1f1fd0b)
 
-## What is Thymeline?
+## What is WindowPots?
 
-Thymeline is a Windows application that manages other application windows, arranging them in a 2D plane where you can scroll horizontally through columns and vertically through rows. Each window becomes a tile in this grid.
+WindowPots is a Windows application that manages other application windows, arranging them in a 2D plane where you can scroll horizontally through columns and vertically through rows. Each window becomes a tile in this grid.
 
 **Note:** This is not a true window manager - it's an application that repositions and manages other windows. Your regular Windows desktop environment remains unchanged.. it was designed this way to help users stay organized on windows machines where they don't have admin privileges.
 
@@ -69,19 +69,19 @@ Thymeline is a Windows application that manages other application windows, arran
 ### Build Steps
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/thymeline.git
-cd thymeline
+git clone https://github.com/yourusername/windowpots.git
+cd windowpots
 
 # Build release version
 cargo build --release
 
 # Run
-./target/release/thymeline.exe
+./target/release/windowpots.exe
 ```
 
 ## How It Works
 
-1. **Start Thymeline** - Run the executable
+1. **Start WindowPots** - Run the executable
 2. **Add Windows** - Focus any window and press `Win+Shift+T` to add it to the grid
 3. **Navigate** - Use `Win+Arrow` keys to move through the 2D plane
 4. **Organize** - Reposition and resize windows as needed
