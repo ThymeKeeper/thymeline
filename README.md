@@ -12,14 +12,14 @@ WindowPots is a Windows application that manages other application windows, arra
 
 ## Features
 
-- **2D Grid Layout** - Windows arranged in rows and columns
-- **Smooth Scrolling** - Navigate horizontally and vertically through your window grid
-- **Smart Positioning** - Windows automatically arrange themselves without gaps
-- **Adjustable Transparency** - Set window transparency (50-255 alpha)
-- **Dynamic Margins** - Adjust spacing between windows
+- **2D Grid Layout** - Tiles arranged in rows and columns
+- **Smooth Scrolling** - Navigate horizontally and vertically through your tile grid
+- **Smart Positioning** - Tiles automatically arrange themselves without gaps
+- **Adjustable Transparency** - Set tile transparency (50-255 alpha)
+- **Dynamic Margins** - Adjust spacing between tiles
 - **Variable Frame Rates** - 60/90/120/144 FPS animation options
 - **Popup Handling** - Dialog boxes and popups remain floating
-- **Entry/Exit Animations** - Visual feedback when adding/removing windows
+- **Entry/Exit Animations** - Visual feedback when adding/removing tiles
 
 ## Keyboard Shortcuts
 
@@ -27,13 +27,13 @@ WindowPots is a Windows application that manages other application windows, arra
 | Shortcut | Action |
 |----------|--------|
 | `Win+Shift+T` | Add current floating window to the grid |
-| `Win+Shift+R` | Remove current window from grid |
+| `Win+Shift+R` | Remove current tile from grid |
 | `Win+C` | Force cleanup and recalculation |
 
 ### Window Sizing
 | Shortcut | Action |
 |----------|--------|
-| `Win+Ctrl+←/→` | Toggle window between full/half width |
+| `Win+Ctrl+←/→` | Toggle tile between full/half width |
 
 ### Window Movement
 | Shortcut | Action |
@@ -60,24 +60,9 @@ WindowPots is a Windows application that manages other application windows, arra
 |----------|--------|
 | `Ctrl+C` | Restore all windows and exit (when the main terminal window is focused) |
 
-## Building from Source
-
 ### Prerequisites
-- Rust (latest stable)
+- Rust
 - Windows 10/11
-
-### Build Steps
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/windowpots.git
-cd windowpots
-
-# Build release version
-cargo build --release
-
-# Run
-./target/release/windowpots.exe
-```
 
 ## How It Works
 
